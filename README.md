@@ -62,6 +62,28 @@ npm run preview
 - Cloudflare Pages Vite guide:
   https://developers.cloudflare.com/pages/framework-guides/deploy-a-vite3-project/
 
+## GitHub Actions からの自動デプロイ
+
+`.github/workflows/deploy-pages.yml` を追加してあるので、GitHub Actions からも Cloudflare Pages に自動デプロイできます。
+
+必要な GitHub Secrets:
+
+- `CLOUDFLARE_API_TOKEN`
+- `CLOUDFLARE_ACCOUNT_ID`
+
+Cloudflare API Token の権限は `Account / Cloudflare Pages / Edit` を使ってください。
+
+### 注意
+
+Cloudflare Pages の `Connect to Git` による自動デプロイを有効のままにしていると、GitHub Actions と二重でデプロイされます。
+
+GitHub Actions に一本化したい場合は Cloudflare Dashboard で以下を無効化してください。
+
+- `Settings` -> `Builds` -> `Branch control`
+- `Enable automatic production branch deployments`
+
+必要なら Preview branch 側も無効化してください。
+
 ## リポジトリ構成
 
 ```text
