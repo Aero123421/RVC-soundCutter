@@ -1,4 +1,4 @@
-import React, { useState, useRef, useCallback, useEffect, useMemo } from "react";
+import React, { useState, useRef, useCallback, useEffect, useMemo, useId } from "react";
 
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 
@@ -80,15 +80,14 @@ function sliceChannels(channelData, start, end) {
   return channelData.map((channel) => channel.slice(start, end));
 }
 
-function concatChannels(...parts) {
-  const channels = parts[0]?.length || 0;
-  return Array.from({ length: channels }, (_, ch) => {
-    const total = parts.reduce((sum, part) => sum + (part[ch]?.length || 0), 0);
+function materializeChannels(sourceChannels, sourceRanges) {
+  if (!sourceChannels?.length) return [];
+  return sourceChannels.map((channel) => {
+    const total = sourceRanges.reduce((sum, range) => sum + (range.end - range.start), 0);
     const merged = new Float32Array(total);
     let offset = 0;
-    parts.forEach((part) => {
-      const chunk = part[ch];
-      if (!chunk?.length) return;
+    sourceRanges.forEach((range) => {
+      const chunk = channel.subarray(range.start, range.end);
       merged.set(chunk, offset);
       offset += chunk.length;
     });
@@ -151,8 +150,7 @@ function applySegmentData(segment, updates) {
 function cloneSegments(segments) {
   return segments.map((segment) => ({
     ...segment,
-    channelData: segment.channelData.slice(),
-    channels: segment.channels.map((channel) => channel.slice()),
+    channelData: segment.channelData,
     sourceRanges: cloneSourceRanges(segment.sourceRanges),
   }));
 }
@@ -177,6 +175,23 @@ function mergeWaveformData(segments) {
     offset += segment.channelData.length;
   });
   return merged;
+}
+
+function useOverviewData(segments) {
+  const cacheRef = useRef({ segments: null, merged: new Float32Array(0) });
+  return useMemo(() => {
+    const prevSegments = cacheRef.current.segments;
+    if (
+      prevSegments &&
+      prevSegments.length === segments.length &&
+      prevSegments.every((segment, index) => segment.channelData === segments[index].channelData)
+    ) {
+      return cacheRef.current.merged;
+    }
+    const merged = mergeWaveformData(segments);
+    cacheRef.current = { segments: [...segments], merged };
+    return merged;
+  }, [segments]);
 }
 
 async function getOriginalSampleRate(file) {
@@ -227,6 +242,18 @@ function useResizeVersion(containerRef) {
   }, [containerRef]);
 
   return resizeVersion;
+}
+
+function useViewportWidth() {
+  const [width, setWidth] = useState(() => (typeof window === "undefined" ? 1024 : window.innerWidth));
+
+  useEffect(() => {
+    const onResize = () => setWidth(window.innerWidth);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  return width;
 }
 
 const fmtLong = (sec) => { const m = Math.floor(sec / 60); const s = (sec % 60).toFixed(2); return `${m}:${s.padStart(5, "0")}`; };
@@ -424,7 +451,7 @@ const FILTER_LABELS = { all: "すべて", pending: "未選択", accepted: "採�
    MAIN APP
    ═══════════════════════════════════════════ */
 export default function App() {
-  const [audioBuffer, setAudioBuffer] = useState(null);
+  const [sourceAudio, setSourceAudio] = useState(null);
   const [fileName, setFileName] = useState("");
   const [segments, setSegments] = useState([]);
   const [activeIdx, setActiveIdx] = useState(0);
@@ -454,6 +481,8 @@ export default function App() {
   const fileInputRef = useRef(null);
   const toastTimer = useRef(null);
   const autoPlayTimerRef = useRef(null);
+  const fileInputId = useId();
+  const viewportWidth = useViewportWidth();
 
   const getCtx = () => { if (!audioCtxRef.current) audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)(); return audioCtxRef.current; };
 
@@ -477,8 +506,10 @@ export default function App() {
 
   const downloadBaseName = useMemo(() => normalizeDownloadBaseName(fileName), [fileName]);
   const timelineSegments = useMemo(() => buildTimelineSegments(segments), [segments]);
-  const overviewData = useMemo(() => mergeWaveformData(segments), [segments]);
+  const overviewData = useOverviewData(segments);
   const overviewTotalSamples = timelineSegments.at(-1)?.timelineEnd || 0;
+  const isCompactLayout = viewportWidth < 720;
+  const hasSegments = segments.length > 0;
 
   const stopPlay = useCallback(() => {
     clearPendingAutoPlay();
@@ -491,11 +522,27 @@ export default function App() {
     setSelStart(null); setSelEnd(null); isDraggingRef.current = false;
   }, []);
 
+  const openFilePicker = useCallback(() => {
+    fileInputRef.current?.click();
+  }, []);
+
+  const updateSelectionHandle = useCallback((edge, ratio) => {
+    stopPlay();
+    if (edge === "start") {
+      setSelStart(ratio);
+      setSelEnd((prev) => prev ?? ratio);
+      return;
+    }
+    setSelStart((prev) => prev ?? ratio);
+    setSelEnd(ratio);
+  }, [stopPlay]);
+
   const playSegment = useCallback((idx) => {
     stopPlay();
-    const seg = segments[idx]; if (!seg) return;
+    const seg = segments[idx];
+    if (!seg || !sourceAudio) return;
     const ctx = getCtx();
-    const b = bufferFromChannels(ctx, seg.channels, seg.sampleRate);
+    const b = bufferFromChannels(ctx, materializeChannels(sourceAudio.channels, seg.sourceRanges), seg.sampleRate);
     const src = ctx.createBufferSource();
     src.buffer = b; src.connect(ctx.destination); src.start();
     sourceRef.current = src; setPlaying(true);
@@ -508,18 +555,19 @@ export default function App() {
     };
     animRef.current = requestAnimationFrame(tick);
     src.onended = () => { setPlaying(false); setPlayProgress(0); };
-  }, [segments, stopPlay]);
+  }, [segments, sourceAudio, stopPlay]);
 
   // Play only the selected region
   const playSelection = useCallback(() => {
     if (selStart == null || selEnd == null) return;
     stopPlay();
-    const seg = segments[activeIdx]; if (!seg) return;
+    const seg = segments[activeIdx];
+    if (!seg || !sourceAudio) return;
     const ctx = getCtx();
     const lo = Math.floor(Math.min(selStart, selEnd) * seg.channelData.length);
     const hi = Math.floor(Math.max(selStart, selEnd) * seg.channelData.length);
     if (hi - lo < 100) return;
-    const b = bufferFromChannels(ctx, sliceChannels(seg.channels, lo, hi), seg.sampleRate);
+    const b = bufferFromChannels(ctx, materializeChannels(sourceAudio.channels, sliceSourceRanges(seg.sourceRanges, lo, hi)), seg.sampleRate);
     const src = ctx.createBufferSource();
     src.buffer = b; src.connect(ctx.destination); src.start();
     sourceRef.current = src; setPlaying(true);
@@ -535,25 +583,26 @@ export default function App() {
     };
     animRef.current = requestAnimationFrame(tick);
     src.onended = () => { setPlaying(false); setPlayProgress(0); };
-  }, [segments, activeIdx, selStart, selEnd, stopPlay]);
+  }, [segments, activeIdx, selStart, selEnd, sourceAudio, stopPlay]);
 
-  const processAudio = useCallback((decoded) => {
-    const mixed = mixToMono(Array.from({ length: decoded.numberOfChannels }, (_, ch) => decoded.getChannelData(ch)));
-    const rawSegs = detectSilentRegions(mixed, decoded.sampleRate, { threshold, minSilenceDuration: minSilence, minSegmentDuration: minSegment });
+  const processAudio = useCallback((audioSource) => {
+    if (!audioSource) return;
+    const { monoData, sampleRate } = audioSource;
+    const rawSegs = detectSilentRegions(monoData, sampleRate, { threshold, minSilenceDuration: minSilence, minSegmentDuration: minSegment });
     let idCounter = 0;
     const segs = rawSegs.map((s) => ({
       id: idCounter++, origStart: s.start, origEnd: s.end,
-      channelData: mixed.slice(s.start, s.end),
-      channels: Array.from({ length: decoded.numberOfChannels }, (_, ch) => decoded.getChannelData(ch).slice(s.start, s.end)),
+      channelData: monoData.slice(s.start, s.end),
       sourceRanges: [{ start: s.start, end: s.end }],
-      sampleRate: decoded.sampleRate,
+      sampleRate,
       status: "pending",
     }));
     setSegments(segs); setActiveIdx(0); setUndoStack([]); clearSelection();
   }, [threshold, minSilence, minSegment, clearSelection]);
 
   const handleFile = useCallback(async (file) => {
-    stopPlay(); setLoading(true); setFileName(file.name);
+    stopPlay();
+    setLoading(true);
     try {
       const ctx = getCtx();
       const [sourceSampleRate, fileBuffer] = await Promise.all([
@@ -562,13 +611,30 @@ export default function App() {
       ]);
       let decoded = await ctx.decodeAudioData(fileBuffer);
       if (sourceSampleRate) decoded = await resampleAudioBuffer(decoded, sourceSampleRate);
-      setAudioBuffer(decoded);
-      processAudio(decoded);
-    } catch (e) { alert("読み込み失敗: " + e.message); }
-    setLoading(false);
+      const channels = Array.from({ length: decoded.numberOfChannels }, (_, ch) => decoded.getChannelData(ch).slice());
+      const nextSourceAudio = {
+        channels,
+        monoData: mixToMono(channels),
+        sampleRate: decoded.sampleRate,
+        duration: decoded.length / decoded.sampleRate,
+      };
+      setSourceAudio(nextSourceAudio);
+      setFileName(file.name);
+      processAudio(nextSourceAudio);
+    } catch (e) {
+      alert("読み込み失敗: " + e.message);
+    } finally {
+      setLoading(false);
+    }
   }, [processAudio, stopPlay]);
 
-  const reanalyze = useCallback(() => { if (audioBuffer) { stopPlay(); processAudio(audioBuffer); showToast("再分析完了"); } }, [audioBuffer, processAudio, stopPlay, showToast]);
+  const reanalyze = useCallback(() => {
+    if (sourceAudio) {
+      stopPlay();
+      processAudio(sourceAudio);
+      showToast("再分析完了");
+    }
+  }, [sourceAudio, processAudio, stopPlay, showToast]);
 
   const pushUndo = useCallback(() => {
     setUndoStack(prev => [...prev.slice(-30), cloneSegments(segments)]);
@@ -594,12 +660,10 @@ export default function App() {
   const cutSelection = useCallback(() => {
     if (!hasSelection) return;
     const seg = segments[activeIdx]; if (!seg) return;
-    pushUndo(); stopPlay();
     const lo = Math.floor(Math.min(selStart, selEnd) * seg.channelData.length);
     const hi = Math.floor(Math.max(selStart, selEnd) * seg.channelData.length);
     const before = seg.channelData.slice(0, lo);
     const after = seg.channelData.slice(hi);
-    const nextChannels = concatChannels(sliceChannels(seg.channels, 0, lo), sliceChannels(seg.channels, hi, seg.channelData.length));
     const nextSourceRanges = normalizeSourceRanges([
       ...sliceSourceRanges(seg.sourceRanges, 0, lo),
       ...sliceSourceRanges(seg.sourceRanges, hi, seg.channelData.length),
@@ -607,8 +671,9 @@ export default function App() {
     const newData = new Float32Array(before.length + after.length);
     newData.set(before, 0); newData.set(after, before.length);
     if (newData.length < 100) { showToast("セグメントが短すぎます", "reject"); return; }
+    pushUndo(); stopPlay();
     setSegments(prev => prev.map((s, i) => i === activeIdx
-      ? applySegmentData(s, { channelData: newData, channels: nextChannels, sourceRanges: nextSourceRanges })
+      ? applySegmentData(s, { channelData: newData, sourceRanges: nextSourceRanges })
       : s));
     clearSelection();
     showToast("選択範囲をカット");
@@ -617,15 +682,14 @@ export default function App() {
   const keepSelection = useCallback(() => {
     if (!hasSelection) return;
     const seg = segments[activeIdx]; if (!seg) return;
-    pushUndo(); stopPlay();
     const lo = Math.floor(Math.min(selStart, selEnd) * seg.channelData.length);
     const hi = Math.floor(Math.max(selStart, selEnd) * seg.channelData.length);
     const newData = seg.channelData.slice(lo, hi);
-    const nextChannels = sliceChannels(seg.channels, lo, hi);
     const nextSourceRanges = sliceSourceRanges(seg.sourceRanges, lo, hi);
     if (newData.length < 100) { showToast("セグメントが短すぎます", "reject"); return; }
+    pushUndo(); stopPlay();
     setSegments(prev => prev.map((s, i) => i === activeIdx
-      ? applySegmentData(s, { channelData: newData, channels: nextChannels, sourceRanges: nextSourceRanges })
+      ? applySegmentData(s, { channelData: newData, sourceRanges: nextSourceRanges })
       : s));
     clearSelection();
     showToast("選択範囲のみ保持");
@@ -640,13 +704,11 @@ export default function App() {
     pushUndo(); stopPlay();
     const part1 = seg.channelData.slice(0, splitPoint);
     const part2 = seg.channelData.slice(splitPoint);
-    const part1Channels = sliceChannels(seg.channels, 0, splitPoint);
-    const part2Channels = sliceChannels(seg.channels, splitPoint, seg.channelData.length);
     const part1SourceRanges = sliceSourceRanges(seg.sourceRanges, 0, splitPoint);
     const part2SourceRanges = sliceSourceRanges(seg.sourceRanges, splitPoint, seg.channelData.length);
     const newSegs = [...segments];
-    const seg1 = applySegmentData(seg, { id: Date.now(), channelData: part1, channels: part1Channels, sourceRanges: part1SourceRanges });
-    const seg2 = applySegmentData(seg, { id: Date.now() + 1, channelData: part2, channels: part2Channels, sourceRanges: part2SourceRanges });
+    const seg1 = applySegmentData(seg, { id: Date.now(), channelData: part1, sourceRanges: part1SourceRanges });
+    const seg2 = applySegmentData(seg, { id: Date.now() + 1, channelData: part2, sourceRanges: part2SourceRanges });
     newSegs.splice(activeIdx, 1, seg1, seg2);
     setSegments(newSegs);
     clearSelection();
@@ -668,26 +730,29 @@ export default function App() {
   }, [autoPlay, playSegment, clearSelection, clearPendingAutoPlay]);
 
   const downloadSeg = useCallback((idx) => {
-    const seg = segments[idx]; if (!seg) return;
+    const seg = segments[idx];
+    if (!seg || !sourceAudio) return;
     const ctx = getCtx();
-    const b = bufferFromChannels(ctx, seg.channels, seg.sampleRate);
+    const b = bufferFromChannels(ctx, materializeChannels(sourceAudio.channels, seg.sourceRanges), seg.sampleRate);
     const blob = encodeWav(b);
     triggerDownload(blob, `${downloadBaseName}_seg_${String(idx + 1).padStart(3, "0")}.wav`);
     showToast(`#${idx + 1} ダウンロード`);
-  }, [segments, downloadBaseName, showToast]);
+  }, [segments, sourceAudio, downloadBaseName, showToast]);
 
   const downloadMerged = useCallback(() => {
+    if (!sourceAudio) return;
     const ctx = getCtx();
     const acc = segments.filter(s => s.status === "accepted");
     if (!acc.length) { showToast("採用セグメントなし", "reject"); return; }
-    const bufs = acc.map(seg => bufferFromChannels(ctx, seg.channels, seg.sampleRate));
+    const bufs = acc.map(seg => bufferFromChannels(ctx, materializeChannels(sourceAudio.channels, seg.sourceRanges), seg.sampleRate));
     const blob = encodeWav(mergeBuffers(ctx, bufs));
     triggerDownload(blob, `${downloadBaseName}_accepted.wav`);
     showToast("結合DL完了");
-  }, [segments, downloadBaseName, showToast]);
+  }, [segments, sourceAudio, downloadBaseName, showToast]);
 
   const downloadIndividual = useCallback(async () => {
     if (zipDownloading) return;
+    if (!sourceAudio) return;
     const ctx = getCtx();
     const acc = segments.filter(s => s.status === "accepted");
     if (!acc.length) { showToast("採用セグメントなし", "reject"); return; }
@@ -698,7 +763,7 @@ export default function App() {
       const zip = new JSZip();
       for (let i = 0; i < acc.length; i++) {
         const seg = acc[i];
-        const blob = encodeWav(bufferFromChannels(ctx, seg.channels, seg.sampleRate));
+        const blob = encodeWav(bufferFromChannels(ctx, materializeChannels(sourceAudio.channels, seg.sourceRanges), seg.sampleRate));
         zip.file(`${downloadBaseName}_${String(i + 1).padStart(3, "0")}.wav`, blob);
         if ((i + 1) % 10 === 0) await new Promise((resolve) => setTimeout(resolve, 0));
       }
@@ -715,7 +780,7 @@ export default function App() {
     } finally {
       setZipDownloading(false);
     }
-  }, [segments, downloadBaseName, zipDownloading, showToast]);
+  }, [segments, sourceAudio, downloadBaseName, zipDownloading, showToast]);
 
   const overviewClick = useCallback((ratio) => {
     if (!timelineSegments.length || !overviewTotalSamples) return;
@@ -777,14 +842,29 @@ export default function App() {
     return { a, r, p, dur, progress };
   }, [segments]);
 
-  const hasAudio = !!audioBuffer;
+  const hasAudio = !!sourceAudio;
   const activeSeg = segments[activeIdx];
   const activeDur = activeSeg ? activeSeg.channelData.length / activeSeg.sampleRate : 0;
   const selDur = (hasSelection && activeSeg) ? Math.abs(selEnd - selStart) * activeSeg.channelData.length / activeSeg.sampleRate : 0;
+  const selectionStartRatio = selStart != null && selEnd != null ? Math.min(selStart, selEnd) : (selStart ?? 0);
+  const selectionEndRatio = selStart != null && selEnd != null ? Math.max(selStart, selEnd) : (selEnd ?? selStart ?? 1);
+  const hasAccepted = stats.a > 0;
+  const canResetAll = hasSegments && segments.some((segment) => segment.status !== "pending");
 
   const css = `
     @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Outfit:wght@300;400;500;600;700&display=swap');
     * { box-sizing: border-box; margin: 0; padding: 0; }
+    button:focus-visible,
+    [role="button"]:focus-visible,
+    [role="switch"]:focus-visible,
+    input[type="range"]:focus-visible {
+      outline: 2px solid #e8c547;
+      outline-offset: 2px;
+    }
+    [data-segment-row="true"]:focus-visible {
+      box-shadow: inset 0 0 0 1px rgba(232,197,71,0.85);
+      background: rgba(232,197,71,0.08);
+    }
     ::-webkit-scrollbar { width: 5px; }
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.07); border-radius: 3px; }
@@ -794,9 +874,9 @@ export default function App() {
     @keyframes selPulse { 0%,100% { border-color: rgba(232,197,71,0.5); } 50% { border-color: rgba(232,197,71,0.2); } }
   `;
 
-  const Btn = ({ children, onClick, style: s, ...rest }) => (
-    <button onClick={onClick} style={{
-      border: "none", cursor: "pointer", fontFamily: "'DM Mono', monospace",
+  const Btn = ({ children, onClick, style: s, disabled = false, ...rest }) => (
+    <button onClick={onClick} disabled={disabled} style={{
+      border: "none", cursor: disabled ? "not-allowed" : "pointer", fontFamily: "'DM Mono', monospace",
       transition: "all 0.12s", outline: "none", ...s
     }} {...rest}>{children}</button>
   );
@@ -804,7 +884,7 @@ export default function App() {
   return (
     <>
       <style>{css}</style>
-      <div style={{ minHeight: "100vh", height: "100dvh", overflow: "auto", background: "#111118", fontFamily: "'DM Mono', monospace", display: "flex", flexDirection: "column", color: "#d8d8e0" }}>
+      <div style={{ minHeight: "100dvh", background: "#111118", fontFamily: "'DM Mono', monospace", display: "flex", flexDirection: "column", color: "#d8d8e0" }}>
 
         {/* ━━━ HEADER ━━━ */}
         <header style={{
@@ -820,14 +900,20 @@ export default function App() {
             <div style={{ display: "flex", alignItems: "center", gap: 6, marginLeft: 12 }}>
               <span style={{ fontSize: 10, color: "#55556a" }}>{fileName}</span>
               <span style={{ fontSize: 9, color: "#55556a" }}>·</span>
-              <span style={{ fontSize: 10, color: "#55556a" }}>{fmtLong(audioBuffer.duration)}</span>
+              <span style={{ fontSize: 10, color: "#55556a" }}>{fmtLong(sourceAudio.duration)}</span>
               <span style={{ fontSize: 9, color: "#55556a" }}>·</span>
-              <span style={{ fontSize: 10, color: "#55556a" }}>{audioBuffer.sampleRate}Hz</span>
+              <span style={{ fontSize: 10, color: "#55556a" }}>{sourceAudio.sampleRate}Hz</span>
             </div>
           )}
           <div style={{ flex: 1 }} />
           {hasAudio && (
-            <div onClick={() => setAutoPlay(!autoPlay)} style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+            <Btn
+              onClick={() => setAutoPlay(!autoPlay)}
+              role="switch"
+              aria-checked={autoPlay}
+              aria-label="自動再生"
+              style={{ background: "transparent", color: "#8888a0", display: "flex", alignItems: "center", gap: 6, padding: 0 }}
+            >
               <div style={{
                 width: 26, height: 14, borderRadius: 7, background: autoPlay ? "#e8c547" : "#1c1c27",
                 border: "1px solid rgba(255,255,255,0.1)", position: "relative", transition: "all 0.2s",
@@ -835,17 +921,35 @@ export default function App() {
                 <div style={{ width: 10, height: 10, borderRadius: 5, background: "#fff", position: "absolute", top: 1, left: autoPlay ? 13 : 1, transition: "left 0.2s" }} />
               </div>
               <span style={{ fontSize: 10, color: "#8888a0" }}>自動再生</span>
-            </div>
+            </Btn>
           )}
-          <Btn onClick={() => setShowSettings(!showSettings)} style={{
+          <Btn
+            onClick={() => setShowSettings(!showSettings)}
+            aria-label={showSettings ? "設定を閉じる" : "設定を開く"}
+            aria-expanded={showSettings}
+            aria-controls="analysis-settings"
+            style={{
             background: showSettings ? "#1c1c27" : "transparent", color: "#8888a0",
             border: "1px solid rgba(255,255,255,0.06)", borderRadius: 5, padding: "4px 8px", fontSize: 10,
           }}>⚙</Btn>
         </header>
 
+        <input
+          id={fileInputId}
+          ref={fileInputRef}
+          type="file"
+          accept="audio/*"
+          style={{ display: "none" }}
+          onChange={e => {
+            const nextFile = e.target.files?.[0];
+            e.target.value = "";
+            if (nextFile) handleFile(nextFile);
+          }}
+        />
+
         {/* ━━━ SETTINGS ━━━ */}
         {showSettings && (
-          <div style={{
+          <div id="analysis-settings" style={{
             padding: "8px 20px", background: "#16161f", borderBottom: "1px solid rgba(255,255,255,0.06)",
             display: "flex", gap: 20, alignItems: "center", flexWrap: "wrap", animation: "fadeIn 0.15s ease",
           }}>
@@ -873,10 +977,10 @@ export default function App() {
           <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", padding: 40 }}
             onDrop={e => { e.preventDefault(); setDragOver(false); e.dataTransfer?.files?.[0] && handleFile(e.dataTransfer.files[0]); }}
             onDragOver={e => { e.preventDefault(); setDragOver(true); }} onDragLeave={() => setDragOver(false)}>
-            <div onClick={() => fileInputRef.current?.click()} style={{
+            <Btn onClick={openFilePicker} style={{
               width: "100%", maxWidth: 480, padding: "56px 36px", textAlign: "center",
               border: `1.5px dashed ${dragOver ? "#e8c547" : "rgba(255,255,255,0.08)"}`,
-              borderRadius: 16, cursor: "pointer", background: dragOver ? "rgba(232,197,71,0.04)" : "transparent", transition: "all 0.3s",
+              borderRadius: 16, background: dragOver ? "rgba(232,197,71,0.04)" : "transparent", transition: "all 0.3s",
             }}>
               <div style={{ fontSize: 40, marginBottom: 16, opacity: 0.5 }}>⟡</div>
               <div style={{ fontFamily: "'Outfit', sans-serif", fontSize: 18, fontWeight: 600, marginBottom: 6 }}>音声ファイルをドロップ</div>
@@ -886,20 +990,14 @@ export default function App() {
                   <span key={s} style={{ fontSize: 9, color: "#55556a", background: "#1c1c27", padding: "2px 7px", borderRadius: 3, border: "1px solid rgba(255,255,255,0.06)" }}>{s}</span>
                 ))}
               </div>
-              <input ref={fileInputRef} type="file" accept="audio/*" style={{ display: "none" }}
-                onChange={e => {
-                  const nextFile = e.target.files?.[0];
-                  e.target.value = "";
-                  if (nextFile) handleFile(nextFile);
-                }} />
-            </div>
+            </Btn>
           </div>
         ) : loading ? (
           <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>
             <div style={{ fontSize: 13, color: "#e8c547", animation: "pulse 1.5s infinite", fontFamily: "'Outfit', sans-serif" }}>解析中...</div>
           </div>
         ) : (
-          <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+          <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
 
             <div style={{ position: "sticky", top: 0, zIndex: 20, background: "#14141c", boxShadow: "0 10px 28px rgba(0,0,0,0.28)" }}>
               {/* ─── OVERVIEW ─── */}
@@ -972,7 +1070,7 @@ export default function App() {
                   </div>
 
                   {/* Cut editing toolbar */}
-                  <div style={{ display: "flex", gap: 5, marginTop: 6, alignItems: "center" }}>
+                  <div style={{ display: "flex", gap: 5, marginTop: 6, alignItems: "center", flexWrap: "wrap" }}>
                     <span style={{ fontSize: 8, color: "#55556a", textTransform: "uppercase", letterSpacing: 1, marginRight: 4 }}>編集</span>
 
                     <Btn onClick={cutSelection} style={{
@@ -1006,14 +1104,39 @@ export default function App() {
                     <div style={{ flex: 1 }} />
                     <span style={{ fontSize: 9, color: "#44445a" }}>ドラッグで範囲選択</span>
                   </div>
+
+                  <div style={{ display: "grid", gridTemplateColumns: isCompactLayout ? "1fr" : "1fr 1fr", gap: 8, marginTop: 8 }}>
+                    <label style={{ fontSize: 9, color: "#55556a", display: "flex", flexDirection: "column", gap: 4 }}>
+                      選択開始
+                      <input
+                        type="range"
+                        min={0}
+                        max={1000}
+                        value={Math.round(selectionStartRatio * 1000)}
+                        onChange={e => updateSelectionHandle("start", Number(e.target.value) / 1000)}
+                        aria-label="選択開始位置"
+                      />
+                    </label>
+                    <label style={{ fontSize: 9, color: "#55556a", display: "flex", flexDirection: "column", gap: 4 }}>
+                      選択終了
+                      <input
+                        type="range"
+                        min={0}
+                        max={1000}
+                        value={Math.round(selectionEndRatio * 1000)}
+                        onChange={e => updateSelectionHandle("end", Number(e.target.value) / 1000)}
+                        aria-label="選択終了位置"
+                      />
+                    </label>
+                  </div>
                 </div>
               )}
             </div>
 
             {/* ─── LIST + SIDEBAR ─── */}
-            <div style={{ flex: 1, display: "flex", overflow: "hidden" }}>
+            <div style={{ flex: 1, display: "flex", flexDirection: isCompactLayout ? "column" : "row", minHeight: 0 }}>
               {/* List */}
-              <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+              <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", minHeight: isCompactLayout ? 240 : 0 }}>
                 <div style={{
                   padding: "6px 16px", display: "flex", alignItems: "center", gap: 4,
                   borderBottom: "1px solid rgba(255,255,255,0.06)", flexShrink: 0,
@@ -1031,16 +1154,10 @@ export default function App() {
                     </button>
                   ))}
                   <div style={{ flex: 1 }} />
-                  <Btn onClick={() => fileInputRef.current?.click()} style={{
+                  <Btn onClick={openFilePicker} style={{
                     background: "transparent", color: "#55556a", border: "1px solid rgba(255,255,255,0.06)",
                     borderRadius: 5, padding: "3px 8px", fontSize: 9,
                   }}>ファイル変更</Btn>
-                  <input ref={fileInputRef} type="file" accept="audio/*" style={{ display: "none" }}
-                    onChange={e => {
-                      const nextFile = e.target.files?.[0];
-                      e.target.value = "";
-                      if (nextFile) handleFile(nextFile);
-                    }} />
                 </div>
                 <div style={{ flex: 1, overflow: "auto", padding: "6px 10px" }}>
                   {filteredIndices.length === 0 ? (
@@ -1052,6 +1169,17 @@ export default function App() {
                     const sc = seg.status === "accepted" ? "#e8c547" : seg.status === "rejected" ? "#ff5266" : "#55556a";
                     return (
                       <div key={seg.id} id={`seg-${idx}`} onClick={() => navigateTo(idx)}
+                        role="button"
+                        tabIndex={0}
+                        data-segment-row="true"
+                        aria-current={isActive ? "true" : undefined}
+                        aria-label={`セグメント ${idx + 1} を選択`}
+                        onKeyDown={e => {
+                          if (e.key === "Enter" || e.key === " ") {
+                            e.preventDefault();
+                            navigateTo(idx);
+                          }
+                        }}
                         style={{
                           display: "flex", alignItems: "center", gap: 8, padding: "5px 10px", borderRadius: 6,
                           cursor: "pointer", marginBottom: 1, transition: "all 0.1s",
@@ -1081,7 +1209,8 @@ export default function App() {
 
               {/* ─── SIDEBAR ─── */}
               <div style={{
-                width: 200, flexShrink: 0, borderLeft: "1px solid rgba(255,255,255,0.06)",
+                width: isCompactLayout ? "100%" : 200, flexShrink: 0, borderLeft: isCompactLayout ? "none" : "1px solid rgba(255,255,255,0.06)",
+                borderTop: isCompactLayout ? "1px solid rgba(255,255,255,0.06)" : "none",
                 padding: "10px 12px", overflow: "auto", display: "flex", flexDirection: "column", gap: 12, background: "#16161f",
               }}>
                 <div>
@@ -1106,18 +1235,18 @@ export default function App() {
                 <div>
                   <div style={{ fontSize: 8, color: "#55556a", textTransform: "uppercase", letterSpacing: 1.5, marginBottom: 6, fontWeight: 500 }}>ダウンロード</div>
                   <Btn onClick={downloadMerged} style={{
-                    width: "100%", background: "#e8c547", color: "#111", borderRadius: 6, padding: "7px",
-                    fontSize: 10, fontWeight: 600, marginBottom: 4,
-                  }}>採用を結合DL</Btn>
+                    width: "100%", background: hasAccepted ? "#e8c547" : "#1c1c27", color: hasAccepted ? "#111" : "#66667a", borderRadius: 6, padding: "7px",
+                    fontSize: 10, fontWeight: 600, marginBottom: 4, opacity: hasAccepted ? 1 : 0.65,
+                  }} disabled={!hasAccepted}>採用を結合DL</Btn>
                   <Btn onClick={downloadIndividual} style={{
                     width: "100%", background: zipDownloading ? "#1c1c27" : "rgba(232,197,71,0.08)", color: zipDownloading ? "#8888a0" : "#e8c547",
                     border: "1px solid rgba(232,197,71,0.25)", borderRadius: 6, padding: "5px", fontSize: 10, marginBottom: 4,
-                    opacity: zipDownloading ? 0.8 : 1,
-                  }} disabled={zipDownloading}>{zipDownloading ? "ZIP作成中..." : "採用をZIP DL"}</Btn>
+                    opacity: (!hasAccepted || zipDownloading) ? 0.8 : 1,
+                  }} disabled={!hasAccepted || zipDownloading}>{zipDownloading ? "ZIP作成中..." : "採用をZIP DL"}</Btn>
                   <Btn onClick={() => downloadSeg(activeIdx)} style={{
                     width: "100%", background: "#1c1c27", color: "#8888a0",
-                    border: "1px solid rgba(255,255,255,0.06)", borderRadius: 6, padding: "5px", fontSize: 9,
-                  }}>選択中DL [D]</Btn>
+                    border: "1px solid rgba(255,255,255,0.06)", borderRadius: 6, padding: "5px", fontSize: 9, opacity: activeSeg ? 1 : 0.55,
+                  }} disabled={!activeSeg}>選択中DL [D]</Btn>
                 </div>
 
                 <div style={{ height: 1, background: "rgba(255,255,255,0.04)" }} />
@@ -1127,17 +1256,17 @@ export default function App() {
                   <div style={{ display: "flex", gap: 3 }}>
                     <Btn onClick={() => { pushUndo(); setSegments(p => p.map(s => ({ ...s, status: "accepted" }))); showToast("すべて採用"); }} style={{
                       flex: 1, background: "rgba(232,197,71,0.08)", color: "#e8c547",
-                      border: "1px solid rgba(232,197,71,0.2)", borderRadius: 5, padding: "4px 0", fontSize: 9,
-                    }}>全採用</Btn>
+                      border: "1px solid rgba(232,197,71,0.2)", borderRadius: 5, padding: "4px 0", fontSize: 9, opacity: hasSegments ? 1 : 0.55,
+                    }} disabled={!hasSegments}>全採用</Btn>
                     <Btn onClick={() => { pushUndo(); setSegments(p => p.map(s => ({ ...s, status: "pending" }))); showToast("リセット"); }} style={{
                       flex: 1, background: "#1c1c27", color: "#55556a",
-                      border: "1px solid rgba(255,255,255,0.06)", borderRadius: 5, padding: "4px 0", fontSize: 9,
-                    }}>リセット</Btn>
+                      border: "1px solid rgba(255,255,255,0.06)", borderRadius: 5, padding: "4px 0", fontSize: 9, opacity: canResetAll ? 1 : 0.55,
+                    }} disabled={!canResetAll}>リセット</Btn>
                   </div>
                   <Btn onClick={undo} style={{
                     width: "100%", background: "transparent", color: "#55556a",
-                    border: "1px solid rgba(255,255,255,0.06)", borderRadius: 5, padding: "4px 0", fontSize: 9, marginTop: 3,
-                  }}>↩ Undo [⌘Z]</Btn>
+                    border: "1px solid rgba(255,255,255,0.06)", borderRadius: 5, padding: "4px 0", fontSize: 9, marginTop: 3, opacity: undoStack.length ? 1 : 0.55,
+                  }} disabled={!undoStack.length}>↩ Undo [⌘Z]</Btn>
                 </div>
 
                 <div style={{ height: 1, background: "rgba(255,255,255,0.04)" }} />
@@ -1173,7 +1302,7 @@ export default function App() {
 
         {/* ━━━ TOAST ━━━ */}
         {toast && (
-          <div style={{
+          <div role="status" aria-live="polite" aria-atomic="true" style={{
             position: "fixed", bottom: 20, left: "50%", transform: "translateX(-50%)",
             background: toast.type === "accept" ? "#e8c547" : toast.type === "reject" ? "#ff5266" : "#1c1c27",
             color: toast.type === "accept" ? "#111" : toast.type === "reject" ? "#fff" : "#d8d8e0",
