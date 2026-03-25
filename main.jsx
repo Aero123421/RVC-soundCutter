@@ -45,12 +45,6 @@ function encodeWav(buf) {
   return new Blob([ab], { type: "audio/wav" });
 }
 
-function sliceBuffer(ctx, src, s, e) {
-  const len = e - s, b = ctx.createBuffer(src.numberOfChannels, len, src.sampleRate);
-  for (let ch = 0; ch < src.numberOfChannels; ch++) b.copyToChannel(src.getChannelData(ch).slice(s, e), ch);
-  return b;
-}
-
 function mergeBuffers(ctx, bufs) {
   if (!bufs.length) return null;
   const sr = bufs[0].sampleRate, n = bufs[0].numberOfChannels;
@@ -61,10 +55,178 @@ function mergeBuffers(ctx, bufs) {
   return out;
 }
 
-function bufferFromFloat32(ctx, data, sr) {
-  const b = ctx.createBuffer(1, data.length, sr);
-  b.copyToChannel(data, 0);
+function bufferFromChannels(ctx, channelData, sr) {
+  const channels = channelData?.length || 1;
+  const length = channelData?.[0]?.length || 0;
+  const b = ctx.createBuffer(channels, length, sr);
+  for (let ch = 0; ch < channels; ch++) b.copyToChannel(channelData[ch], ch);
   return b;
+}
+
+function mixToMono(channelData) {
+  if (!channelData?.length) return new Float32Array(0);
+  if (channelData.length === 1) return channelData[0].slice();
+  const len = channelData[0].length;
+  const mixed = new Float32Array(len);
+  for (let ch = 0; ch < channelData.length; ch++) {
+    const src = channelData[ch];
+    for (let i = 0; i < len; i++) mixed[i] += src[i];
+  }
+  for (let i = 0; i < len; i++) mixed[i] /= channelData.length;
+  return mixed;
+}
+
+function sliceChannels(channelData, start, end) {
+  return channelData.map((channel) => channel.slice(start, end));
+}
+
+function concatChannels(...parts) {
+  const channels = parts[0]?.length || 0;
+  return Array.from({ length: channels }, (_, ch) => {
+    const total = parts.reduce((sum, part) => sum + (part[ch]?.length || 0), 0);
+    const merged = new Float32Array(total);
+    let offset = 0;
+    parts.forEach((part) => {
+      const chunk = part[ch];
+      if (!chunk?.length) return;
+      merged.set(chunk, offset);
+      offset += chunk.length;
+    });
+    return merged;
+  });
+}
+
+function cloneSourceRanges(ranges = []) {
+  return ranges.map((range) => ({ ...range }));
+}
+
+function normalizeSourceRanges(ranges = []) {
+  const merged = [];
+  ranges
+    .filter((range) => range && range.end > range.start)
+    .sort((a, b) => a.start - b.start)
+    .forEach((range) => {
+      const last = merged[merged.length - 1];
+      if (last && range.start <= last.end) {
+        last.end = Math.max(last.end, range.end);
+      } else {
+        merged.push({ ...range });
+      }
+    });
+  return merged;
+}
+
+function sliceSourceRanges(ranges, start, end) {
+  const out = [];
+  let cursor = 0;
+  for (const range of ranges || []) {
+    const rangeLength = range.end - range.start;
+    const overlapStart = Math.max(start, cursor);
+    const overlapEnd = Math.min(end, cursor + rangeLength);
+    if (overlapEnd > overlapStart) {
+      out.push({
+        start: range.start + (overlapStart - cursor),
+        end: range.start + (overlapEnd - cursor),
+      });
+    }
+    cursor += rangeLength;
+    if (cursor >= end) break;
+  }
+  return normalizeSourceRanges(out);
+}
+
+function applySegmentData(segment, updates) {
+  const sourceRanges = normalizeSourceRanges(updates.sourceRanges ?? segment.sourceRanges ?? []);
+  const firstRange = sourceRanges[0];
+  const lastRange = sourceRanges[sourceRanges.length - 1];
+  return {
+    ...segment,
+    ...updates,
+    sourceRanges,
+    origStart: firstRange?.start ?? segment.origStart,
+    origEnd: lastRange?.end ?? segment.origEnd,
+  };
+}
+
+function cloneSegments(segments) {
+  return segments.map((segment) => ({
+    ...segment,
+    channelData: segment.channelData.slice(),
+    channels: segment.channels.map((channel) => channel.slice()),
+    sourceRanges: cloneSourceRanges(segment.sourceRanges),
+  }));
+}
+
+function buildTimelineSegments(segments) {
+  let cursor = 0;
+  return segments.map((segment) => {
+    const length = segment.channelData.length;
+    const timelineStart = cursor;
+    const timelineEnd = timelineStart + length;
+    cursor = timelineEnd;
+    return { ...segment, timelineStart, timelineEnd };
+  });
+}
+
+function mergeWaveformData(segments) {
+  const total = segments.reduce((sum, segment) => sum + segment.channelData.length, 0);
+  const merged = new Float32Array(total);
+  let offset = 0;
+  segments.forEach((segment) => {
+    merged.set(segment.channelData, offset);
+    offset += segment.channelData.length;
+  });
+  return merged;
+}
+
+async function getOriginalSampleRate(file) {
+  try {
+    const { parseBlob } = await import("music-metadata");
+    const metadata = await parseBlob(file);
+    return metadata.format.sampleRate || null;
+  } catch {
+    return null;
+  }
+}
+
+async function resampleAudioBuffer(source, targetSampleRate) {
+  if (!targetSampleRate || source.sampleRate === targetSampleRate) return source;
+  const frameCount = Math.ceil(source.duration * targetSampleRate);
+  const offlineCtx = new OfflineAudioContext(source.numberOfChannels, frameCount, targetSampleRate);
+  const src = offlineCtx.createBufferSource();
+  src.buffer = source;
+  src.connect(offlineCtx.destination);
+  src.start(0);
+  return offlineCtx.startRendering();
+}
+
+function triggerDownload(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+
+function normalizeDownloadBaseName(fileName) {
+  const raw = (fileName || "audio").replace(/\.[^.]+$/, "");
+  return raw.replace(/[\\/:*?"<>|]+/g, "_") || "audio";
+}
+
+function useResizeVersion(containerRef) {
+  const [resizeVersion, setResizeVersion] = useState(0);
+
+  useEffect(() => {
+    if (!containerRef.current || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => setResizeVersion((v) => v + 1));
+    observer.observe(containerRef.current);
+    return () => observer.disconnect();
+  }, [containerRef]);
+
+  return resizeVersion;
 }
 
 const fmtLong = (sec) => { const m = Math.floor(sec / 60); const s = (sec % 60).toFixed(2); return `${m}:${s.padStart(5, "0")}`; };
@@ -142,16 +304,9 @@ function drawOverviewWave(canvas, data, segments, totalSamples, activeIdx) {
   c.strokeStyle = "rgba(255,255,255,0.04)"; c.lineWidth = 0.5;
   for (let i = 0; i < 10; i++) { const x = (i / 10) * W; c.beginPath(); c.moveTo(x, 0); c.lineTo(x, H); c.stroke(); }
   c.beginPath(); c.moveTo(0, H / 2); c.lineTo(W, H / 2); c.stroke();
-  c.fillStyle = "rgba(255,60,80,0.06)";
-  let prev = 0;
-  for (const seg of segments) {
-    if (seg.origStart > prev) { c.fillRect((prev / totalSamples) * W, 0, ((seg.origStart - prev) / totalSamples) * W, H); }
-    prev = seg.origEnd;
-  }
-  if (prev < totalSamples) c.fillRect((prev / totalSamples) * W, 0, ((totalSamples - prev) / totalSamples) * W, H);
   if (segments[activeIdx]) {
     const s = segments[activeIdx];
-    const x1 = (s.origStart / totalSamples) * W, x2 = (s.origEnd / totalSamples) * W;
+    const x1 = (s.timelineStart / totalSamples) * W, x2 = (s.timelineEnd / totalSamples) * W;
     c.fillStyle = "rgba(232,197,71,0.12)"; c.fillRect(x1, 0, x2 - x1, H);
     c.strokeStyle = "rgba(232,197,71,0.5)"; c.lineWidth = 1; c.strokeRect(x1, 0, x2 - x1, H);
   }
@@ -166,7 +321,7 @@ function drawOverviewWave(canvas, data, segments, totalSamples, activeIdx) {
   }
   c.strokeStyle = "rgba(255,255,255,0.35)"; c.lineWidth = 1; c.stroke();
   segments.forEach((seg) => {
-    const x1 = (seg.origStart / totalSamples) * W, x2 = (seg.origEnd / totalSamples) * W;
+    const x1 = (seg.timelineStart / totalSamples) * W, x2 = (seg.timelineEnd / totalSamples) * W;
     const color = seg.status === "accepted" ? "#e8c547" : seg.status === "rejected" ? "#ff4f5e" : "rgba(255,255,255,0.15)";
     c.fillStyle = color; c.fillRect(x1, 0, Math.max(x2 - x1, 2), 3);
   });
@@ -179,6 +334,7 @@ function DetailWaveform({ data, color, progress, selStart, selEnd, onDragStart, 
   const ref = useRef(null);
   const containerRef = useRef(null);
   const activePointerIdRef = useRef(null);
+  const resizeVersion = useResizeVersion(containerRef);
 
   useEffect(() => {
     const cvs = ref.current; if (!cvs || !data) return;
@@ -186,7 +342,7 @@ function DetailWaveform({ data, color, progress, selStart, selEnd, onDragStart, 
     cvs.width = pr.width * 2; cvs.height = pr.height * 2;
     cvs.style.width = pr.width + "px"; cvs.style.height = pr.height + "px";
     drawDetailWave(cvs, data, color, progress, selStart, selEnd);
-  }, [data, color, progress, selStart, selEnd]);
+  }, [data, color, progress, selStart, selEnd, resizeVersion]);
 
   const getRatio = (e) => {
     if (!containerRef.current) return 0;
@@ -230,26 +386,29 @@ function DetailWaveform({ data, color, progress, selStart, selEnd, onDragStart, 
 
 function MiniWaveform({ data, color, progress, style }) {
   const ref = useRef(null);
+  const containerRef = useRef(null);
+  const resizeVersion = useResizeVersion(containerRef);
   useEffect(() => {
     const cvs = ref.current; if (!cvs || !data) return;
     const pr = cvs.parentElement.getBoundingClientRect();
     cvs.width = pr.width * 2; cvs.height = pr.height * 2;
     cvs.style.width = pr.width + "px"; cvs.style.height = pr.height + "px";
     drawMiniWave(cvs, data, color, progress);
-  }, [data, color, progress]);
-  return <div style={{ width: "100%", height: "100%", ...style }}><canvas ref={ref} style={{ display: "block", width: "100%", height: "100%" }} /></div>;
+  }, [data, color, progress, resizeVersion]);
+  return <div ref={containerRef} style={{ width: "100%", height: "100%", ...style }}><canvas ref={ref} style={{ display: "block", width: "100%", height: "100%" }} /></div>;
 }
 
 function OverviewWaveform({ data, segments, totalSamples, activeIdx, onClickPosition }) {
   const ref = useRef(null);
   const containerRef = useRef(null);
+  const resizeVersion = useResizeVersion(containerRef);
   useEffect(() => {
     const cvs = ref.current; if (!cvs || !data) return;
     const pr = cvs.parentElement.getBoundingClientRect();
     cvs.width = pr.width * 2; cvs.height = pr.height * 2;
     cvs.style.width = pr.width + "px"; cvs.style.height = pr.height + "px";
     drawOverviewWave(cvs, data, segments, totalSamples, activeIdx);
-  }, [data, segments, totalSamples, activeIdx]);
+  }, [data, segments, totalSamples, activeIdx, resizeVersion]);
   return (
     <div ref={containerRef} onClick={e => { if (!containerRef.current || !onClickPosition) return; const r = containerRef.current.getBoundingClientRect(); onClickPosition((e.clientX - r.left) / r.width); }}
       style={{ width: "100%", height: "100%", cursor: "crosshair" }}>
@@ -266,7 +425,6 @@ const FILTER_LABELS = { all: "すべて", pending: "未選択", accepted: "採�
    ═══════════════════════════════════════════ */
 export default function App() {
   const [audioBuffer, setAudioBuffer] = useState(null);
-  const [fullChannelData, setFullChannelData] = useState(null);
   const [fileName, setFileName] = useState("");
   const [segments, setSegments] = useState([]);
   const [activeIdx, setActiveIdx] = useState(0);
@@ -282,6 +440,7 @@ export default function App() {
   const [toast, setToast] = useState(null);
   const [undoStack, setUndoStack] = useState([]);
   const [dragOver, setDragOver] = useState(false);
+  const [zipDownloading, setZipDownloading] = useState(false);
   // Selection state for cut editing (ratios 0-1)
   const [selStart, setSelStart] = useState(null);
   const [selEnd, setSelEnd] = useState(null);
@@ -294,8 +453,16 @@ export default function App() {
   const playDurRef = useRef(0);
   const fileInputRef = useRef(null);
   const toastTimer = useRef(null);
+  const autoPlayTimerRef = useRef(null);
 
   const getCtx = () => { if (!audioCtxRef.current) audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)(); return audioCtxRef.current; };
+
+  const clearPendingAutoPlay = useCallback(() => {
+    if (autoPlayTimerRef.current) {
+      clearTimeout(autoPlayTimerRef.current);
+      autoPlayTimerRef.current = null;
+    }
+  }, []);
 
   const showToast = useCallback((msg, type = "info") => {
     clearTimeout(toastTimer.current);
@@ -308,11 +475,17 @@ export default function App() {
     return segments.reduce((acc, s, i) => { if (s.status === filter) acc.push(i); return acc; }, []);
   }, [segments, filter]);
 
+  const downloadBaseName = useMemo(() => normalizeDownloadBaseName(fileName), [fileName]);
+  const timelineSegments = useMemo(() => buildTimelineSegments(segments), [segments]);
+  const overviewData = useMemo(() => mergeWaveformData(segments), [segments]);
+  const overviewTotalSamples = timelineSegments.at(-1)?.timelineEnd || 0;
+
   const stopPlay = useCallback(() => {
+    clearPendingAutoPlay();
     if (sourceRef.current) { try { sourceRef.current.stop(); } catch (e) { } sourceRef.current = null; }
     if (animRef.current) cancelAnimationFrame(animRef.current);
     setPlaying(false); setPlayProgress(0);
-  }, []);
+  }, [clearPendingAutoPlay]);
 
   const clearSelection = useCallback(() => {
     setSelStart(null); setSelEnd(null); isDraggingRef.current = false;
@@ -322,7 +495,7 @@ export default function App() {
     stopPlay();
     const seg = segments[idx]; if (!seg) return;
     const ctx = getCtx();
-    const b = bufferFromFloat32(ctx, seg.channelData, seg.sampleRate);
+    const b = bufferFromChannels(ctx, seg.channels, seg.sampleRate);
     const src = ctx.createBufferSource();
     src.buffer = b; src.connect(ctx.destination); src.start();
     sourceRef.current = src; setPlaying(true);
@@ -346,8 +519,7 @@ export default function App() {
     const lo = Math.floor(Math.min(selStart, selEnd) * seg.channelData.length);
     const hi = Math.floor(Math.max(selStart, selEnd) * seg.channelData.length);
     if (hi - lo < 100) return;
-    const slice = seg.channelData.slice(lo, hi);
-    const b = bufferFromFloat32(ctx, slice, seg.sampleRate);
+    const b = bufferFromChannels(ctx, sliceChannels(seg.channels, lo, hi), seg.sampleRate);
     const src = ctx.createBufferSource();
     src.buffer = b; src.connect(ctx.destination); src.start();
     sourceRef.current = src; setPlaying(true);
@@ -366,13 +538,14 @@ export default function App() {
   }, [segments, activeIdx, selStart, selEnd, stopPlay]);
 
   const processAudio = useCallback((decoded) => {
-    const ch = decoded.getChannelData(0);
-    setFullChannelData(ch);
-    const rawSegs = detectSilentRegions(ch, decoded.sampleRate, { threshold, minSilenceDuration: minSilence, minSegmentDuration: minSegment });
+    const mixed = mixToMono(Array.from({ length: decoded.numberOfChannels }, (_, ch) => decoded.getChannelData(ch)));
+    const rawSegs = detectSilentRegions(mixed, decoded.sampleRate, { threshold, minSilenceDuration: minSilence, minSegmentDuration: minSegment });
     let idCounter = 0;
     const segs = rawSegs.map((s) => ({
       id: idCounter++, origStart: s.start, origEnd: s.end,
-      channelData: ch.slice(s.start, s.end),
+      channelData: mixed.slice(s.start, s.end),
+      channels: Array.from({ length: decoded.numberOfChannels }, (_, ch) => decoded.getChannelData(ch).slice(s.start, s.end)),
+      sourceRanges: [{ start: s.start, end: s.end }],
       sampleRate: decoded.sampleRate,
       status: "pending",
     }));
@@ -383,7 +556,12 @@ export default function App() {
     stopPlay(); setLoading(true); setFileName(file.name);
     try {
       const ctx = getCtx();
-      const decoded = await ctx.decodeAudioData(await file.arrayBuffer());
+      const [sourceSampleRate, fileBuffer] = await Promise.all([
+        getOriginalSampleRate(file),
+        file.arrayBuffer(),
+      ]);
+      let decoded = await ctx.decodeAudioData(fileBuffer);
+      if (sourceSampleRate) decoded = await resampleAudioBuffer(decoded, sourceSampleRate);
       setAudioBuffer(decoded);
       processAudio(decoded);
     } catch (e) { alert("読み込み失敗: " + e.message); }
@@ -393,7 +571,7 @@ export default function App() {
   const reanalyze = useCallback(() => { if (audioBuffer) { stopPlay(); processAudio(audioBuffer); showToast("再分析完了"); } }, [audioBuffer, processAudio, stopPlay, showToast]);
 
   const pushUndo = useCallback(() => {
-    setUndoStack(prev => [...prev.slice(-30), segments.map(s => ({ ...s, channelData: s.channelData }))]);
+    setUndoStack(prev => [...prev.slice(-30), cloneSegments(segments)]);
   }, [segments]);
 
   const undo = useCallback(() => {
@@ -421,10 +599,17 @@ export default function App() {
     const hi = Math.floor(Math.max(selStart, selEnd) * seg.channelData.length);
     const before = seg.channelData.slice(0, lo);
     const after = seg.channelData.slice(hi);
+    const nextChannels = concatChannels(sliceChannels(seg.channels, 0, lo), sliceChannels(seg.channels, hi, seg.channelData.length));
+    const nextSourceRanges = normalizeSourceRanges([
+      ...sliceSourceRanges(seg.sourceRanges, 0, lo),
+      ...sliceSourceRanges(seg.sourceRanges, hi, seg.channelData.length),
+    ]);
     const newData = new Float32Array(before.length + after.length);
     newData.set(before, 0); newData.set(after, before.length);
     if (newData.length < 100) { showToast("セグメントが短すぎます", "reject"); return; }
-    setSegments(prev => prev.map((s, i) => i === activeIdx ? { ...s, channelData: newData } : s));
+    setSegments(prev => prev.map((s, i) => i === activeIdx
+      ? applySegmentData(s, { channelData: newData, channels: nextChannels, sourceRanges: nextSourceRanges })
+      : s));
     clearSelection();
     showToast("選択範囲をカット");
   }, [hasSelection, segments, activeIdx, selStart, selEnd, pushUndo, stopPlay, clearSelection, showToast]);
@@ -436,8 +621,12 @@ export default function App() {
     const lo = Math.floor(Math.min(selStart, selEnd) * seg.channelData.length);
     const hi = Math.floor(Math.max(selStart, selEnd) * seg.channelData.length);
     const newData = seg.channelData.slice(lo, hi);
+    const nextChannels = sliceChannels(seg.channels, lo, hi);
+    const nextSourceRanges = sliceSourceRanges(seg.sourceRanges, lo, hi);
     if (newData.length < 100) { showToast("セグメントが短すぎます", "reject"); return; }
-    setSegments(prev => prev.map((s, i) => i === activeIdx ? { ...s, channelData: newData } : s));
+    setSegments(prev => prev.map((s, i) => i === activeIdx
+      ? applySegmentData(s, { channelData: newData, channels: nextChannels, sourceRanges: nextSourceRanges })
+      : s));
     clearSelection();
     showToast("選択範囲のみ保持");
   }, [hasSelection, segments, activeIdx, selStart, selEnd, pushUndo, stopPlay, clearSelection, showToast]);
@@ -451,9 +640,13 @@ export default function App() {
     pushUndo(); stopPlay();
     const part1 = seg.channelData.slice(0, splitPoint);
     const part2 = seg.channelData.slice(splitPoint);
+    const part1Channels = sliceChannels(seg.channels, 0, splitPoint);
+    const part2Channels = sliceChannels(seg.channels, splitPoint, seg.channelData.length);
+    const part1SourceRanges = sliceSourceRanges(seg.sourceRanges, 0, splitPoint);
+    const part2SourceRanges = sliceSourceRanges(seg.sourceRanges, splitPoint, seg.channelData.length);
     const newSegs = [...segments];
-    const seg1 = { ...seg, id: Date.now(), channelData: part1 };
-    const seg2 = { ...seg, id: Date.now() + 1, channelData: part2, origStart: seg.origStart + splitPoint };
+    const seg1 = applySegmentData(seg, { id: Date.now(), channelData: part1, channels: part1Channels, sourceRanges: part1SourceRanges });
+    const seg2 = applySegmentData(seg, { id: Date.now() + 1, channelData: part2, channels: part2Channels, sourceRanges: part2SourceRanges });
     newSegs.splice(activeIdx, 1, seg1, seg2);
     setSegments(newSegs);
     clearSelection();
@@ -464,56 +657,80 @@ export default function App() {
   const prevFiltered = useCallback((from) => { const c = filteredIndices.indexOf(from); return c > 0 ? filteredIndices[c - 1] : from; }, [filteredIndices]);
 
   const navigateTo = useCallback((idx) => {
+    clearPendingAutoPlay();
     setActiveIdx(idx); clearSelection();
-    if (autoPlay) setTimeout(() => playSegment(idx), 50);
-  }, [autoPlay, playSegment, clearSelection]);
+    if (autoPlay) {
+      autoPlayTimerRef.current = setTimeout(() => {
+        autoPlayTimerRef.current = null;
+        playSegment(idx);
+      }, 50);
+    }
+  }, [autoPlay, playSegment, clearSelection, clearPendingAutoPlay]);
 
   const downloadSeg = useCallback((idx) => {
     const seg = segments[idx]; if (!seg) return;
     const ctx = getCtx();
-    const b = bufferFromFloat32(ctx, seg.channelData, seg.sampleRate);
+    const b = bufferFromChannels(ctx, seg.channels, seg.sampleRate);
     const blob = encodeWav(b);
-    const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
-    a.download = `seg_${String(idx + 1).padStart(3, "0")}.wav`; a.click();
+    triggerDownload(blob, `${downloadBaseName}_seg_${String(idx + 1).padStart(3, "0")}.wav`);
     showToast(`#${idx + 1} ダウンロード`);
-  }, [segments, showToast]);
+  }, [segments, downloadBaseName, showToast]);
 
   const downloadMerged = useCallback(() => {
     const ctx = getCtx();
     const acc = segments.filter(s => s.status === "accepted");
     if (!acc.length) { showToast("採用セグメントなし", "reject"); return; }
-    const bufs = acc.map(seg => bufferFromFloat32(ctx, seg.channelData, seg.sampleRate));
+    const bufs = acc.map(seg => bufferFromChannels(ctx, seg.channels, seg.sampleRate));
     const blob = encodeWav(mergeBuffers(ctx, bufs));
-    const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
-    a.download = `${fileName.replace(/\.[^.]+$/, "")}_accepted.wav`; a.click();
+    triggerDownload(blob, `${downloadBaseName}_accepted.wav`);
     showToast("結合DL完了");
-  }, [segments, fileName, showToast]);
+  }, [segments, downloadBaseName, showToast]);
 
-  const downloadIndividual = useCallback(() => {
+  const downloadIndividual = useCallback(async () => {
+    if (zipDownloading) return;
     const ctx = getCtx();
     const acc = segments.filter(s => s.status === "accepted");
     if (!acc.length) { showToast("採用セグメントなし", "reject"); return; }
-    acc.forEach((seg, i) => {
-      const blob = encodeWav(bufferFromFloat32(ctx, seg.channelData, seg.sampleRate));
-      const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
-      a.download = `${fileName.replace(/\.[^.]+$/, "")}_${String(i + 1).padStart(3, "0")}.wav`; a.click();
-    });
-    showToast(`${acc.length}ファイルDL`);
-  }, [segments, fileName, showToast]);
+    setZipDownloading(true);
+    showToast("ZIP作成中...");
+    try {
+      const [{ default: JSZip }] = await Promise.all([import("jszip")]);
+      const zip = new JSZip();
+      for (let i = 0; i < acc.length; i++) {
+        const seg = acc[i];
+        const blob = encodeWav(bufferFromChannels(ctx, seg.channels, seg.sampleRate));
+        zip.file(`${downloadBaseName}_${String(i + 1).padStart(3, "0")}.wav`, blob);
+        if ((i + 1) % 10 === 0) await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+      const zipBlob = await zip.generateAsync({
+        type: "blob",
+        compression: "DEFLATE",
+        compressionOptions: { level: 6 },
+        streamFiles: true,
+      });
+      triggerDownload(zipBlob, `${downloadBaseName}_accepted_segments.zip`);
+      showToast(`${acc.length}ファイルをZIP保存`);
+    } catch (e) {
+      showToast(`ZIP作成失敗: ${e.message}`, "reject");
+    } finally {
+      setZipDownloading(false);
+    }
+  }, [segments, downloadBaseName, zipDownloading, showToast]);
 
   const overviewClick = useCallback((ratio) => {
-    if (!segments.length || !audioBuffer) return;
-    const pos = ratio * audioBuffer.length;
+    if (!timelineSegments.length || !overviewTotalSamples) return;
+    const pos = ratio * overviewTotalSamples;
     let closest = 0, minD = Infinity;
-    segments.forEach((seg, i) => { const d = Math.abs((seg.origStart + seg.origEnd) / 2 - pos); if (d < minD) { minD = d; closest = i; } });
+    timelineSegments.forEach((seg, i) => { const d = Math.abs((seg.timelineStart + seg.timelineEnd) / 2 - pos); if (d < minD) { minD = d; closest = i; } });
     navigateTo(closest);
-  }, [segments, audioBuffer, navigateTo]);
+  }, [timelineSegments, overviewTotalSamples, navigateTo]);
 
   // Keyboard
   useEffect(() => {
     const h = (e) => {
       if (!segments.length) return;
-      if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
+      if (!(e.target instanceof Element)) return;
+      if (e.target.closest("input, textarea, select, button, a, [role='button'], [contenteditable='true']")) return;
       const key = e.key.toLowerCase();
       if (key === " ") {
         e.preventDefault();
@@ -540,6 +757,15 @@ export default function App() {
     const el = document.getElementById(`seg-${activeIdx}`);
     if (el) el.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }, [activeIdx]);
+
+  useEffect(() => {
+    if (!autoPlay) clearPendingAutoPlay();
+  }, [autoPlay, clearPendingAutoPlay]);
+
+  useEffect(() => () => {
+    clearPendingAutoPlay();
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+  }, [clearPendingAutoPlay]);
 
   const stats = useMemo(() => {
     const a = segments.filter(s => s.status === "accepted").length;
@@ -578,7 +804,7 @@ export default function App() {
   return (
     <>
       <style>{css}</style>
-      <div style={{ minHeight: "100vh", background: "#111118", fontFamily: "'DM Mono', monospace", display: "flex", flexDirection: "column", color: "#d8d8e0" }}>
+      <div style={{ minHeight: "100vh", height: "100dvh", overflow: "auto", background: "#111118", fontFamily: "'DM Mono', monospace", display: "flex", flexDirection: "column", color: "#d8d8e0" }}>
 
         {/* ━━━ HEADER ━━━ */}
         <header style={{
@@ -661,7 +887,11 @@ export default function App() {
                 ))}
               </div>
               <input ref={fileInputRef} type="file" accept="audio/*" style={{ display: "none" }}
-                onChange={e => e.target.files?.[0] && handleFile(e.target.files[0])} />
+                onChange={e => {
+                  const nextFile = e.target.files?.[0];
+                  e.target.value = "";
+                  if (nextFile) handleFile(nextFile);
+                }} />
             </div>
           </div>
         ) : loading ? (
@@ -671,112 +901,114 @@ export default function App() {
         ) : (
           <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
 
-            {/* ─── OVERVIEW ─── */}
-            <div style={{ height: 58, flexShrink: 0, borderBottom: "1px solid rgba(255,255,255,0.06)", background: "#16161f", padding: "4px 20px" }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 2 }}>
-                <span style={{ fontSize: 8, color: "#55556a", textTransform: "uppercase", letterSpacing: 1.5, fontWeight: 500 }}>Overview</span>
-                <div style={{ flex: 1, height: 1, background: "rgba(255,255,255,0.04)" }} />
-                <div style={{ width: 80, height: 2, background: "#111118", borderRadius: 1, overflow: "hidden" }}>
-                  <div style={{ width: `${stats.progress}%`, height: "100%", background: "#e8c547", borderRadius: 1, transition: "width 0.3s" }} />
+            <div style={{ position: "sticky", top: 0, zIndex: 20, background: "#14141c", boxShadow: "0 10px 28px rgba(0,0,0,0.28)" }}>
+              {/* ─── OVERVIEW ─── */}
+              <div style={{ height: 58, flexShrink: 0, borderBottom: "1px solid rgba(255,255,255,0.06)", background: "#16161f", padding: "4px 20px" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 2 }}>
+                  <span style={{ fontSize: 8, color: "#55556a", textTransform: "uppercase", letterSpacing: 1.5, fontWeight: 500 }}>Overview</span>
+                  <div style={{ flex: 1, height: 1, background: "rgba(255,255,255,0.04)" }} />
+                  <div style={{ width: 80, height: 2, background: "#111118", borderRadius: 1, overflow: "hidden" }}>
+                    <div style={{ width: `${stats.progress}%`, height: "100%", background: "#e8c547", borderRadius: 1, transition: "width 0.3s" }} />
+                  </div>
+                  <span style={{ fontSize: 8, color: "#55556a" }}>{Math.round(stats.progress)}%</span>
                 </div>
-                <span style={{ fontSize: 8, color: "#55556a" }}>{Math.round(stats.progress)}%</span>
+                <div style={{ height: 36, borderRadius: 5, overflow: "hidden", background: "rgba(0,0,0,0.3)" }}>
+                  <OverviewWaveform data={overviewData} segments={timelineSegments} totalSamples={overviewTotalSamples} activeIdx={activeIdx} onClickPosition={overviewClick} />
+                </div>
               </div>
-              <div style={{ height: 36, borderRadius: 5, overflow: "hidden", background: "rgba(0,0,0,0.3)" }}>
-                <OverviewWaveform data={fullChannelData} segments={segments} totalSamples={audioBuffer.length} activeIdx={activeIdx} onClickPosition={overviewClick} />
-              </div>
-            </div>
 
-            {/* ─── ACTIVE DETAIL + CUT EDITOR ─── */}
-            {activeSeg && (
-              <div style={{ flexShrink: 0, borderBottom: "1px solid rgba(255,255,255,0.06)", background: "#14141c", padding: "10px 20px" }}>
-                {/* Info row */}
-                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-                  <span style={{ fontSize: 11, fontWeight: 500, fontFamily: "'Outfit', sans-serif" }}>#{activeIdx + 1}</span>
-                  <span style={{
-                    fontSize: 9, padding: "1px 7px", borderRadius: 3, fontWeight: 500,
-                    background: activeSeg.status === "accepted" ? "rgba(232,197,71,0.08)" : activeSeg.status === "rejected" ? "rgba(255,82,102,0.08)" : "#1c1c27",
-                    color: activeSeg.status === "accepted" ? "#e8c547" : activeSeg.status === "rejected" ? "#ff5266" : "#55556a",
-                    border: `1px solid ${activeSeg.status === "accepted" ? "rgba(232,197,71,0.3)" : activeSeg.status === "rejected" ? "rgba(255,82,102,0.3)" : "rgba(255,255,255,0.06)"}`,
-                  }}>{activeSeg.status === "accepted" ? "採用" : activeSeg.status === "rejected" ? "不採用" : "未選択"}</span>
-                  <span style={{ fontSize: 9, color: "#55556a" }}>{activeDur.toFixed(2)}s</span>
-
-                  {hasSelection && (
+              {/* ─── ACTIVE DETAIL + CUT EDITOR ─── */}
+              {activeSeg && (
+                <div style={{ flexShrink: 0, borderBottom: "1px solid rgba(255,255,255,0.06)", background: "#14141c", padding: "10px 20px" }}>
+                  {/* Info row */}
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                    <span style={{ fontSize: 11, fontWeight: 500, fontFamily: "'Outfit', sans-serif" }}>#{activeIdx + 1}</span>
                     <span style={{
-                      fontSize: 9, padding: "1px 7px", borderRadius: 3,
-                      background: "rgba(232,197,71,0.1)", color: "#e8c547",
-                      border: "1px solid rgba(232,197,71,0.25)",
-                      animation: "selPulse 2s infinite",
-                    }}>
-                      選択: {selDur.toFixed(2)}s
-                    </span>
-                  )}
+                      fontSize: 9, padding: "1px 7px", borderRadius: 3, fontWeight: 500,
+                      background: activeSeg.status === "accepted" ? "rgba(232,197,71,0.08)" : activeSeg.status === "rejected" ? "rgba(255,82,102,0.08)" : "#1c1c27",
+                      color: activeSeg.status === "accepted" ? "#e8c547" : activeSeg.status === "rejected" ? "#ff5266" : "#55556a",
+                      border: `1px solid ${activeSeg.status === "accepted" ? "rgba(232,197,71,0.3)" : activeSeg.status === "rejected" ? "rgba(255,82,102,0.3)" : "rgba(255,255,255,0.06)"}`,
+                    }}>{activeSeg.status === "accepted" ? "採用" : activeSeg.status === "rejected" ? "不採用" : "未選択"}</span>
+                    <span style={{ fontSize: 9, color: "#55556a" }}>{activeDur.toFixed(2)}s</span>
 
-                  <div style={{ flex: 1 }} />
+                    {hasSelection && (
+                      <span style={{
+                        fontSize: 9, padding: "1px 7px", borderRadius: 3,
+                        background: "rgba(232,197,71,0.1)", color: "#e8c547",
+                        border: "1px solid rgba(232,197,71,0.25)",
+                        animation: "selPulse 2s infinite",
+                      }}>
+                        選択: {selDur.toFixed(2)}s
+                      </span>
+                    )}
 
-                  <Btn onClick={() => { if (playing) stopPlay(); else if (hasSelection) playSelection(); else playSegment(activeIdx); }} style={{
-                    background: playing ? "#e8c547" : "rgba(232,197,71,0.08)", color: playing ? "#111" : "#e8c547",
-                    border: "1px solid rgba(232,197,71,0.4)", borderRadius: 5, padding: "3px 14px", fontSize: 10, fontWeight: 500,
-                  }}>{playing ? "■ 停止" : hasSelection ? "▶ 選択再生" : "▶ 再生"}</Btn>
-                  <Btn onClick={() => setStatus(activeIdx, "accepted")} style={{
-                    background: "rgba(232,197,71,0.08)", color: "#e8c547",
-                    border: "1px solid rgba(232,197,71,0.25)", borderRadius: 5, padding: "3px 12px", fontSize: 10,
-                  }}>✓ 採用 [A]</Btn>
-                  <Btn onClick={() => setStatus(activeIdx, "rejected")} style={{
-                    background: "rgba(255,82,102,0.08)", color: "#ff5266",
-                    border: "1px solid rgba(255,82,102,0.25)", borderRadius: 5, padding: "3px 12px", fontSize: 10,
-                  }}>✗ 不採用 [R]</Btn>
+                    <div style={{ flex: 1 }} />
+
+                    <Btn onClick={() => { if (playing) stopPlay(); else if (hasSelection) playSelection(); else playSegment(activeIdx); }} style={{
+                      background: playing ? "#e8c547" : "rgba(232,197,71,0.08)", color: playing ? "#111" : "#e8c547",
+                      border: "1px solid rgba(232,197,71,0.4)", borderRadius: 5, padding: "3px 14px", fontSize: 10, fontWeight: 500,
+                    }}>{playing ? "■ 停止" : hasSelection ? "▶ 選択再生" : "▶ 再生"}</Btn>
+                    <Btn onClick={() => setStatus(activeIdx, "accepted")} style={{
+                      background: "rgba(232,197,71,0.08)", color: "#e8c547",
+                      border: "1px solid rgba(232,197,71,0.25)", borderRadius: 5, padding: "3px 12px", fontSize: 10,
+                    }}>✓ 採用 [A]</Btn>
+                    <Btn onClick={() => setStatus(activeIdx, "rejected")} style={{
+                      background: "rgba(255,82,102,0.08)", color: "#ff5266",
+                      border: "1px solid rgba(255,82,102,0.25)", borderRadius: 5, padding: "3px 12px", fontSize: 10,
+                    }}>✗ 不採用 [R]</Btn>
+                  </div>
+
+                  {/* Detail waveform with drag-to-select */}
+                  <div style={{ height: 80, borderRadius: 6, overflow: "hidden", background: "rgba(0,0,0,0.35)", border: "1px solid rgba(255,255,255,0.04)" }}>
+                    <DetailWaveform
+                      data={activeSeg.channelData}
+                      color={activeSeg.status === "accepted" ? "#e8c547" : activeSeg.status === "rejected" ? "#ff5266" : "rgba(255,255,255,0.4)"}
+                      progress={playProgress}
+                      selStart={selStart} selEnd={selEnd}
+                      onDragStart={(r) => { stopPlay(); setSelStart(r); setSelEnd(r); isDraggingRef.current = true; }}
+                      onDragMove={(r) => { if (isDraggingRef.current) setSelEnd(r); }}
+                      onDragEnd={(r) => { setSelEnd(r); isDraggingRef.current = false; }}
+                    />
+                  </div>
+
+                  {/* Cut editing toolbar */}
+                  <div style={{ display: "flex", gap: 5, marginTop: 6, alignItems: "center" }}>
+                    <span style={{ fontSize: 8, color: "#55556a", textTransform: "uppercase", letterSpacing: 1, marginRight: 4 }}>編集</span>
+
+                    <Btn onClick={cutSelection} style={{
+                      background: hasSelection ? "rgba(255,82,102,0.1)" : "#1c1c27",
+                      color: hasSelection ? "#ff5266" : "#44445a",
+                      border: `1px solid ${hasSelection ? "rgba(255,82,102,0.3)" : "rgba(255,255,255,0.06)"}`,
+                      borderRadius: 5, padding: "3px 10px", fontSize: 10,
+                      opacity: hasSelection ? 1 : 0.4,
+                    }} disabled={!hasSelection}>✂ カット [X]</Btn>
+
+                    <Btn onClick={keepSelection} style={{
+                      background: hasSelection ? "rgba(232,197,71,0.1)" : "#1c1c27",
+                      color: hasSelection ? "#e8c547" : "#44445a",
+                      border: `1px solid ${hasSelection ? "rgba(232,197,71,0.3)" : "rgba(255,255,255,0.06)"}`,
+                      borderRadius: 5, padding: "3px 10px", fontSize: 10,
+                      opacity: hasSelection ? 1 : 0.4,
+                    }} disabled={!hasSelection}>⊏ 残す [C]</Btn>
+
+                    <Btn onClick={splitAtCursor} style={{
+                      background: "rgba(130,160,255,0.08)", color: "#8ea0ff",
+                      border: "1px solid rgba(130,160,255,0.25)", borderRadius: 5, padding: "3px 10px", fontSize: 10,
+                    }}>⫼ 分割 [S]</Btn>
+
+                    {hasSelection && (
+                      <Btn onClick={clearSelection} style={{
+                        background: "transparent", color: "#55556a",
+                        border: "1px solid rgba(255,255,255,0.06)", borderRadius: 5, padding: "3px 8px", fontSize: 9,
+                      }}>選択解除 [Esc]</Btn>
+                    )}
+
+                    <div style={{ flex: 1 }} />
+                    <span style={{ fontSize: 9, color: "#44445a" }}>ドラッグで範囲選択</span>
+                  </div>
                 </div>
-
-                {/* Detail waveform with drag-to-select */}
-                <div style={{ height: 80, borderRadius: 6, overflow: "hidden", background: "rgba(0,0,0,0.35)", border: "1px solid rgba(255,255,255,0.04)" }}>
-                  <DetailWaveform
-                    data={activeSeg.channelData}
-                    color={activeSeg.status === "accepted" ? "#e8c547" : activeSeg.status === "rejected" ? "#ff5266" : "rgba(255,255,255,0.4)"}
-                    progress={playProgress}
-                    selStart={selStart} selEnd={selEnd}
-                    onDragStart={(r) => { stopPlay(); setSelStart(r); setSelEnd(r); isDraggingRef.current = true; }}
-                    onDragMove={(r) => { if (isDraggingRef.current) setSelEnd(r); }}
-                    onDragEnd={(r) => { setSelEnd(r); isDraggingRef.current = false; }}
-                  />
-                </div>
-
-                {/* Cut editing toolbar */}
-                <div style={{ display: "flex", gap: 5, marginTop: 6, alignItems: "center" }}>
-                  <span style={{ fontSize: 8, color: "#55556a", textTransform: "uppercase", letterSpacing: 1, marginRight: 4 }}>編集</span>
-
-                  <Btn onClick={cutSelection} style={{
-                    background: hasSelection ? "rgba(255,82,102,0.1)" : "#1c1c27",
-                    color: hasSelection ? "#ff5266" : "#44445a",
-                    border: `1px solid ${hasSelection ? "rgba(255,82,102,0.3)" : "rgba(255,255,255,0.06)"}`,
-                    borderRadius: 5, padding: "3px 10px", fontSize: 10,
-                    opacity: hasSelection ? 1 : 0.4,
-                  }} disabled={!hasSelection}>✂ カット [X]</Btn>
-
-                  <Btn onClick={keepSelection} style={{
-                    background: hasSelection ? "rgba(232,197,71,0.1)" : "#1c1c27",
-                    color: hasSelection ? "#e8c547" : "#44445a",
-                    border: `1px solid ${hasSelection ? "rgba(232,197,71,0.3)" : "rgba(255,255,255,0.06)"}`,
-                    borderRadius: 5, padding: "3px 10px", fontSize: 10,
-                    opacity: hasSelection ? 1 : 0.4,
-                  }} disabled={!hasSelection}>⊏ 残す [C]</Btn>
-
-                  <Btn onClick={splitAtCursor} style={{
-                    background: "rgba(130,160,255,0.08)", color: "#8ea0ff",
-                    border: "1px solid rgba(130,160,255,0.25)", borderRadius: 5, padding: "3px 10px", fontSize: 10,
-                  }}>⫼ 分割 [S]</Btn>
-
-                  {hasSelection && (
-                    <Btn onClick={clearSelection} style={{
-                      background: "transparent", color: "#55556a",
-                      border: "1px solid rgba(255,255,255,0.06)", borderRadius: 5, padding: "3px 8px", fontSize: 9,
-                    }}>選択解除 [Esc]</Btn>
-                  )}
-
-                  <div style={{ flex: 1 }} />
-                  <span style={{ fontSize: 9, color: "#44445a" }}>ドラッグで範囲選択</span>
-                </div>
-              </div>
-            )}
+              )}
+            </div>
 
             {/* ─── LIST + SIDEBAR ─── */}
             <div style={{ flex: 1, display: "flex", overflow: "hidden" }}>
@@ -804,7 +1036,11 @@ export default function App() {
                     borderRadius: 5, padding: "3px 8px", fontSize: 9,
                   }}>ファイル変更</Btn>
                   <input ref={fileInputRef} type="file" accept="audio/*" style={{ display: "none" }}
-                    onChange={e => e.target.files?.[0] && handleFile(e.target.files[0])} />
+                    onChange={e => {
+                      const nextFile = e.target.files?.[0];
+                      e.target.value = "";
+                      if (nextFile) handleFile(nextFile);
+                    }} />
                 </div>
                 <div style={{ flex: 1, overflow: "auto", padding: "6px 10px" }}>
                   {filteredIndices.length === 0 ? (
@@ -836,7 +1072,7 @@ export default function App() {
                         <span style={{ fontSize: 9, color: "#55556a", minWidth: 30, textAlign: "right" }}>{dur}s</span>
                         <Btn onClick={e => { e.stopPropagation(); downloadSeg(idx); }} style={{
                           background: "transparent", border: "none", color: "#55556a", fontSize: 11, padding: "1px 3px", opacity: 0.6,
-                        }} title="DL">↓</Btn>
+                        }} title="DL" aria-label={`セグメント ${idx + 1} をダウンロード`}>↓</Btn>
                       </div>
                     );
                   })}
@@ -874,9 +1110,10 @@ export default function App() {
                     fontSize: 10, fontWeight: 600, marginBottom: 4,
                   }}>採用を結合DL</Btn>
                   <Btn onClick={downloadIndividual} style={{
-                    width: "100%", background: "rgba(232,197,71,0.08)", color: "#e8c547",
+                    width: "100%", background: zipDownloading ? "#1c1c27" : "rgba(232,197,71,0.08)", color: zipDownloading ? "#8888a0" : "#e8c547",
                     border: "1px solid rgba(232,197,71,0.25)", borderRadius: 6, padding: "5px", fontSize: 10, marginBottom: 4,
-                  }}>採用を個別DL</Btn>
+                    opacity: zipDownloading ? 0.8 : 1,
+                  }} disabled={zipDownloading}>{zipDownloading ? "ZIP作成中..." : "採用をZIP DL"}</Btn>
                   <Btn onClick={() => downloadSeg(activeIdx)} style={{
                     width: "100%", background: "#1c1c27", color: "#8888a0",
                     border: "1px solid rgba(255,255,255,0.06)", borderRadius: 6, padding: "5px", fontSize: 9,

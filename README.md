@@ -9,7 +9,7 @@
 - セグメントごとの再生、採用、不採用
 - 波形ドラッグによる範囲選択
 - 選択範囲のカット、選択範囲のみ残す、カーソル位置分割
-- 採用セグメントの結合ダウンロード、個別ダウンロード
+- 採用セグメントの結合ダウンロード、ZIP ダウンロード
 
 ## 技術スタック
 
@@ -39,7 +39,8 @@ npm run preview
 
 ### Pages 側の設定値
 
-- Framework preset: `Vite`
+- Framework preset: `React (Vite)` があればそれを選択
+- `React (Vite)` が無ければ `None` か `Other` を選んで下の値を手入力
 - Production branch: `main`
 - Build command: `npm run build`
 - Build output directory: `dist`
@@ -61,28 +62,6 @@ npm run preview
   https://developers.cloudflare.com/pages/get-started/git-integration/
 - Cloudflare Pages Vite guide:
   https://developers.cloudflare.com/pages/framework-guides/deploy-a-vite3-project/
-
-## GitHub Actions からの自動デプロイ
-
-`.github/workflows/deploy-pages.yml` を追加してあるので、GitHub Actions からも Cloudflare Pages に自動デプロイできます。
-
-必要な GitHub Secrets:
-
-- `CLOUDFLARE_API_TOKEN`
-- `CLOUDFLARE_ACCOUNT_ID`
-
-Cloudflare API Token の権限は `Account / Cloudflare Pages / Edit` を使ってください。
-
-### 注意
-
-Cloudflare Pages の `Connect to Git` による自動デプロイを有効のままにしていると、GitHub Actions と二重でデプロイされます。
-
-GitHub Actions に一本化したい場合は Cloudflare Dashboard で以下を無効化してください。
-
-- `Settings` -> `Builds` -> `Branch control`
-- `Enable automatic production branch deployments`
-
-必要なら Preview branch 側も無効化してください。
 
 ## リポジトリ構成
 
