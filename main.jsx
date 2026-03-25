@@ -468,6 +468,7 @@ export default function App() {
   const [undoStack, setUndoStack] = useState([]);
   const [dragOver, setDragOver] = useState(false);
   const [zipDownloading, setZipDownloading] = useState(false);
+  const [showSelectionControls, setShowSelectionControls] = useState(false);
   // Selection state for cut editing (ratios 0-1)
   const [selStart, setSelStart] = useState(null);
   const [selEnd, setSelEnd] = useState(null);
@@ -795,7 +796,7 @@ export default function App() {
     const h = (e) => {
       if (!segments.length) return;
       if (!(e.target instanceof Element)) return;
-      if (e.target.closest("input, textarea, select, button, a, [role='button'], [contenteditable='true']")) return;
+      if (e.target.closest("input, textarea, select, [contenteditable='true']")) return;
       const key = e.key.toLowerCase();
       if (key === " ") {
         e.preventDefault();
@@ -854,17 +855,6 @@ export default function App() {
   const css = `
     @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Outfit:wght@300;400;500;600;700&display=swap');
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    button:focus-visible,
-    [role="button"]:focus-visible,
-    [role="switch"]:focus-visible,
-    input[type="range"]:focus-visible {
-      outline: 2px solid #e8c547;
-      outline-offset: 2px;
-    }
-    [data-segment-row="true"]:focus-visible {
-      box-shadow: inset 0 0 0 1px rgba(232,197,71,0.85);
-      background: rgba(232,197,71,0.08);
-    }
     ::-webkit-scrollbar { width: 5px; }
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.07); border-radius: 3px; }
@@ -1094,6 +1084,12 @@ export default function App() {
                       border: "1px solid rgba(130,160,255,0.25)", borderRadius: 5, padding: "3px 10px", fontSize: 10,
                     }}>⫼ 分割 [S]</Btn>
 
+                    <Btn onClick={() => setShowSelectionControls(prev => !prev)} style={{
+                      background: showSelectionControls ? "rgba(232,197,71,0.08)" : "transparent",
+                      color: showSelectionControls ? "#e8c547" : "#55556a",
+                      border: "1px solid rgba(255,255,255,0.06)", borderRadius: 5, padding: "3px 8px", fontSize: 9,
+                    }}>{showSelectionControls ? "範囲入力を閉じる" : "範囲入力"}</Btn>
+
                     {hasSelection && (
                       <Btn onClick={clearSelection} style={{
                         background: "transparent", color: "#55556a",
@@ -1105,30 +1101,32 @@ export default function App() {
                     <span style={{ fontSize: 9, color: "#44445a" }}>ドラッグで範囲選択</span>
                   </div>
 
-                  <div style={{ display: "grid", gridTemplateColumns: isCompactLayout ? "1fr" : "1fr 1fr", gap: 8, marginTop: 8 }}>
-                    <label style={{ fontSize: 9, color: "#55556a", display: "flex", flexDirection: "column", gap: 4 }}>
-                      選択開始
-                      <input
-                        type="range"
-                        min={0}
-                        max={1000}
-                        value={Math.round(selectionStartRatio * 1000)}
-                        onChange={e => updateSelectionHandle("start", Number(e.target.value) / 1000)}
-                        aria-label="選択開始位置"
-                      />
-                    </label>
-                    <label style={{ fontSize: 9, color: "#55556a", display: "flex", flexDirection: "column", gap: 4 }}>
-                      選択終了
-                      <input
-                        type="range"
-                        min={0}
-                        max={1000}
-                        value={Math.round(selectionEndRatio * 1000)}
-                        onChange={e => updateSelectionHandle("end", Number(e.target.value) / 1000)}
-                        aria-label="選択終了位置"
-                      />
-                    </label>
-                  </div>
+                  {showSelectionControls && (
+                    <div style={{ display: "grid", gridTemplateColumns: isCompactLayout ? "1fr" : "1fr 1fr", gap: 8, marginTop: 8 }}>
+                      <label style={{ fontSize: 9, color: "#55556a", display: "flex", flexDirection: "column", gap: 4 }}>
+                        選択開始
+                        <input
+                          type="range"
+                          min={0}
+                          max={1000}
+                          value={Math.round(selectionStartRatio * 1000)}
+                          onChange={e => updateSelectionHandle("start", Number(e.target.value) / 1000)}
+                          aria-label="選択開始位置"
+                        />
+                      </label>
+                      <label style={{ fontSize: 9, color: "#55556a", display: "flex", flexDirection: "column", gap: 4 }}>
+                        選択終了
+                        <input
+                          type="range"
+                          min={0}
+                          max={1000}
+                          value={Math.round(selectionEndRatio * 1000)}
+                          onChange={e => updateSelectionHandle("end", Number(e.target.value) / 1000)}
+                          aria-label="選択終了位置"
+                        />
+                      </label>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
